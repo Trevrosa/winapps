@@ -32,7 +32,7 @@ readonly SLEEP_MARKER="${APPDATA_PATH}/sleep_marker"
 
 # OTHER
 readonly CONTAINER_NAME="WinApps" # FOR 'docker' AND 'podman' ONLY
-readonly RDP_PORT=3389
+RDP_PORT=3389
 readonly DOCKER_IP="127.0.0.1"
 # shellcheck disable=SC2155 # Silence warnings regarding masking return values through simultaneous declaration and assignment.
 readonly RUNID="${RANDOM}"
@@ -371,6 +371,8 @@ function waLoadConfig() {
         waThrowExit $EC_MISSING_CONFIG
     fi
 
+    RDP_PORT="${RDP_PORT:-3389}"
+
     # Update $RDP_SCALE.
     waFixScale
     # Update when $REMOVABLE_MEDIA is null
@@ -410,8 +412,21 @@ function waGetFreeRDPCommand() {
 
     # Attempt to set a FreeRDP command if the command variable is empty.
     if [ -z "$FREERDP_COMMAND" ]; then
+        if [ "$1" = "windows" ] && [ "$XDG_SESSION_TYPE" = "wayland" ]; then
+            if command -v sdl-freerdp3 &>/dev/null; then
+                FREERDP_COMMAND="sdl-freerdp3"
+            elif command -v sdl3-freerdp &>/dev/null; then
+                FREERDP_COMMAND="sdl3-freerdp"
+            elif command -v sdl-freerdp &>/dev/null; then
+                FREERDP_COMMAND="sdl-freerdp"
+            elif command -v flatpak &>/dev/null && flatpak list --columns=application | grep -q "^com.freerdp.FreeRDP$"; then
+                FREERDP_COMMAND="flatpak run --command=sdl-freerdp com.freerdp.FreeRDP"
+                RDP_FLATPAK=1
+            fi
+        fi
+
         # Check for 'xfreerdp'.
-        if command -v xfreerdp &>/dev/null; then
+        if [ -z "$FREERDP_COMMAND" ] && command -v xfreerdp &>/dev/null; then
             # Check FreeRDP major version is 3 or greater.
             FREERDP_MAJOR_VERSION=$(xfreerdp --version | head -n 1 | grep -o -m 1 '\b[0-9]\S*' | head -n 1 | cut -d'.' -f1)
             if [[ $FREERDP_MAJOR_VERSION =~ ^[0-9]+$ ]] && ((FREERDP_MAJOR_VERSION >= 3)); then
@@ -445,7 +460,7 @@ function waGetFreeRDPCommand() {
         fi
     fi
 
-    if command -v "$FREERDP_COMMAND" &>/dev/null || [ "$FREERDP_COMMAND" = "flatpak run --command=xfreerdp com.freerdp.FreeRDP" ]; then
+    if command -v "$FREERDP_COMMAND" &>/dev/null || [ "$FREERDP_COMMAND" = "flatpak run --command=xfreerdp com.freerdp.FreeRDP" ] || [ "$FREERDP_COMMAND" = "flatpak run --command=sdl-freerdp com.freerdp.FreeRDP" ]; then
         dprint "Using FreeRDP command '${FREERDP_COMMAND}'."
 
         # Append additional flags or parameters to FreeRDP.
@@ -572,6 +587,10 @@ function waCheckVMRunning() {
         TIME_ELAPSED=0
 
         while (( TIME_ELAPSED < BOOT_TIMEOUT )); do
+            # libvirt users need to find the IP address dynamically
+            if [[ -z "$RDP_IP" ]]; then
+                RDP_IP=$(waFindVMIP)
+            fi
             # Check if VM is running
             if (virsh list --state-running --name | grep -Fxq -- "$VM_NAME"); then
                 # Try to connect to RDP port to verify it's ready
@@ -720,7 +739,6 @@ function waCheckContainerRunning() {
 # Role: Assesses whether the RDP port on Windows is open.
 function waCheckPortOpen() {
     # Declare variables.
-    local VM_MAC="" # Stores the MAC address of the Windows VM.
     local TIME_ELAPSED=0
     local TIME_LIMIT=30
     local TIME_INTERVAL=5
@@ -728,13 +746,12 @@ function waCheckPortOpen() {
     # Obtain Windows VM IP Address ('libvirt' ONLY)
     # Note: 'RDP_IP' should not be empty if 'WAFLAVOR' is 'docker', since it is set to localhost before this function is called.
     if [ -z "$RDP_IP" ] && [ "$WAFLAVOR" = "libvirt" ]; then
-        VM_MAC=$(virsh domiflist "$VM_NAME" | grep -oE "([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})") # VM MAC address.
 
         while (( TIME_ELAPSED < TIME_LIMIT )); do
             if [ "$TIME_ELAPSED" -eq "$TIME_INTERVAL" ]; then
                 notify-send --expire-time=4000 --icon="dialog-info" --app-name="WinApps" --urgency="low" "WinApps" "Requesting Windows IP address..."
             fi
-            RDP_IP=$(ip neigh show | grep -F -- "$VM_MAC" | grep -oE "([0-9]{1,3}\.){3}[0-9]{1,3}") # VM IP address.
+            RDP_IP=$(waFindVMIP)
             [ -n "$RDP_IP" ] && break
             sleep $TIME_INTERVAL
             TIME_ELAPSED=$((TIME_ELAPSED + TIME_INTERVAL))
@@ -772,7 +789,7 @@ function waRunCommand() {
             +dynamic-resolution \
             /wm-class:"Microsoft Windows" \
             /t:"Windows RDP Session [$RDP_IP]" \
-            /v:"$RDP_IP" &>/dev/null &
+            /v:"$RDP_IP":"$RDP_PORT" &>/dev/null &
 
         # Capture the process ID.
         FREERDP_PID=$!
@@ -788,7 +805,7 @@ function waRunCommand() {
             /scale:"$RDP_SCALE" \
             +auto-reconnect \
             /app:program:"$2",hidef:"$HIDEF" \
-            /v:"$RDP_IP" &>/dev/null &
+            /v:"$RDP_IP":"$RDP_PORT" &>/dev/null &
 
         # Capture the process ID.
         FREERDP_PID=$!
@@ -823,7 +840,7 @@ function waRunCommand() {
                 +auto-reconnect \
                 /wm-class:"$FULL_NAME" \
                 /app:program:"$WIN_EXECUTABLE",hidef:"$HIDEF",icon:"$ICON",name:"$FULL_NAME" \
-                /v:"$RDP_IP" &>/dev/null &
+                /v:"$RDP_IP":"$RDP_PORT" &>/dev/null &
 
             # Capture the process ID.
             FREERDP_PID=$!
@@ -847,7 +864,7 @@ function waRunCommand() {
                 /drive:media,"$REMOVABLE_MEDIA" \
                 /wm-class:"$FULL_NAME" \
                 /app:program:"$WIN_EXECUTABLE",hidef:"$HIDEF",icon:"$ICON",name:"$FULL_NAME",cmd:\""$FILE_PATH"\" \
-                /v:"$RDP_IP" &>/dev/null &
+                /v:"$RDP_IP":"$RDP_PORT" &>/dev/null &
 
             # Capture the process ID.
             FREERDP_PID=$!
@@ -961,6 +978,15 @@ function waTimeSync() {
     } > "$SLEEP_DETECT_PATH"
 }
 
+function waFindVMIP() {
+    local VM_MAC=""
+
+    VM_MAC=$(virsh domiflist "$VM_NAME" | grep -oE "([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})") # VM MAC address.
+
+    # VM IP address
+    ip neigh show | grep -F -- "$VM_MAC" | grep -oE "([0-9]{1,3}\.){3}[0-9]{1,3}"
+}
+
 ### MAIN LOGIC ###
 #set -x # Enable for debugging.
 mkdir -p "$APPDATA_PATH"
@@ -971,7 +997,7 @@ dprint "HOME_DIR: ${HOME}"
 waEarlyDispatch "$@"
 waLastRun
 waLoadConfig
-waGetFreeRDPCommand
+waGetFreeRDPCommand "$1"
 waCleanFreeRDP
 
 # Send password on the command line if a command to retrieve the password from is not given
